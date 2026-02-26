@@ -10,7 +10,9 @@ use App\Models\Resident;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 use Telegram\Bot\Api;
+use Telegram\Bot\FileUpload\InputFile;
 use Telegram\Bot\Keyboard\Keyboard;
 use Telegram\Bot\Laravel\Facades\Telegram;
 
@@ -36,7 +38,26 @@ class TelegramWebhookController extends Controller
             if ($text === '/start') {
                 Cache::forget("tg_state_$chatId");
                 Cache::forget("tg_data_$chatId");
+                Cache::forget("tg_album_files_$chatId");
                 if(Cache::has("tg_lang_$chatId")){
+                    // agar residents jadvalda telegram_id bo'yicha mavjud bo'lsa, to'g'ridan-to'g'ri telefon raqamini so'raymiz
+                    $resident = Resident::where('telegram_id', $chatId)->first();
+                    if($resident){
+                        // agar mavjud bo'lmasa ,kerakli amalni tanlasin 1.mening murojaatlarim 2.yangi murojaat
+                        $keyboard = Keyboard::make()
+                            ->setResizeKeyboard(true)
+                            ->setOneTimeKeyboard(false)
+                            ->row([
+                                Keyboard::button(['text' => $this->t($chatId, 'new_request')]),
+                                Keyboard::button(['text' => $this->t($chatId, 'my_requests')]),
+                            ]);
+                            
+                        return $telegram->sendMessage([
+                            'chat_id' => $chatId,
+                            'text' => $this->t($chatId, 'select_action'),
+                            'reply_markup' => $keyboard,
+                        ]);
+                    }
                     Cache::put("tg_state_$chatId", 'phone');
                     $keyboard = Keyboard::make()
                         ->setResizeKeyboard(true)
@@ -70,6 +91,214 @@ class TelegramWebhookController extends Controller
 
 
                 return response('ok', 200);
+            }
+            if ($text === $this->t($chatId, 'my_requests')) {
+                $resident = Resident::where('telegram_id', $chatId)->first();
+                
+                if ($resident) {
+                    // Munosabatlarni (with) birga yuklaymiz, bazaga so'rov kamayishi uchun
+                    $requests = Application::with(['status', 'region', 'photos'])
+                        ->where('resident_id', $resident->id)
+                        ->latest()
+                        ->get();
+
+                    if ($requests->count() > 0) {
+                        $telegram->sendMessage([
+                            'chat_id' => $chatId,
+                            'text' => "<b>📋 Sizning jami murojaatlaringiz: " . $requests->count() . " ta</b>",
+                            'parse_mode' => 'HTML'
+                        ]);
+
+                        foreach ($requests as $request) {
+                            $caption = "🆔 <b>Murojaat №{$request->id}</b>\n"
+                                . "📅 <b>Vaqti:</b> " . $request->created_at->format('d.m.Y H:i') . "\n"
+                                . "📍 <b>Region:</b> {$request->region->name['qr']}\n"
+                                . "🏠 <b>Manzil:</b> {$request->address}\n"
+                                . "📝 <b>Xabar:</b> {$request->message}\n"
+                                . "🚥 <b>Status:</b> <u>" . ($request->status->name['qr'] ?? 'Noma\'lum') . "</u>";
+
+                            // Agar rasmlar bo'lsa
+                            if ($request->photos->count() > 0) {
+                                $media = [];
+                                $files = [];
+
+                                foreach ($request->photos as $index => $photo) {
+
+                                    $filePath = storage_path("app/public/{$photo->photo_path}");
+
+                                    if (!file_exists($filePath)) {
+                                        continue;
+                                    }
+
+                                    $attachName = "photo{$index}";
+
+                                    $mediaItem = [
+                                        'type' => 'photo',
+                                        'media' => "attach://{$attachName}",
+                                    ];
+
+                                    // Faqat birinchi rasmga caption
+                                    if ($index === 0) {
+                                        $mediaItem['caption'] = (string) $caption; // majburiy string
+                                        $mediaItem['parse_mode'] = 'HTML';
+                                    }
+
+                                    $media[] = $mediaItem;
+
+                                    $files[$attachName] = InputFile::create($filePath);
+                                }
+
+                                if (!empty($media)) {
+                                    $telegram->sendMediaGroup(array_merge([
+                                        'chat_id' => $chatId,
+                                        'media'   => json_encode($media),
+                                    ], $files));
+                                }
+                            } else {
+                                // Rasm bo'lmasa faqat matnni yuboramiz
+                                $telegram->sendMessage([
+                                    'chat_id' => $chatId,
+                                    'text' => $caption,
+                                    'parse_mode' => 'HTML'
+                                ]);
+                            }
+                        }
+                    } else {
+                        $telegram->sendMessage([
+                            'chat_id' => $chatId,
+                            'text' => "📭 Sizda hali hech qanday murojaat yo'q."
+                        ]);
+                    }
+                } else {
+                    // Ro'yxatdan o'tmagan foydalanuvchi uchun (Sizning kodingiz)
+                    Cache::put("tg_state_$chatId", 'phone');
+                    $keyboard = Keyboard::make()
+                        ->setResizeKeyboard(true)
+                        ->setOneTimeKeyboard(true)
+                        ->row([
+                            Keyboard::button([
+                                'text' => $this->t($chatId, 'contact_button'),
+                                'request_contact' => true,
+                            ]),
+                        ]);
+                    $telegram->sendMessage([
+                        'chat_id' => $chatId,
+                        'text' => "Iltimos, avval telefon raqamingizni yuboring",
+                        'reply_markup' => $keyboard,
+                    ]);
+                }
+            }
+            if ($text === $this->t($chatId, 'new_request')) {
+                $resident = Resident::where('telegram_id', $chatId)->first();
+
+                if (!$resident) {
+                    // Agar ro'yxatdan o'tmagan bo'lsa telefon bosqichiga qaytaramiz
+                    Cache::put("tg_state_$chatId", 'phone');
+
+                    $keyboard = Keyboard::make()
+                        ->setResizeKeyboard(true)
+                        ->setOneTimeKeyboard(true)
+                        ->row([
+                            Keyboard::button([
+                                'text' => $this->t($chatId, 'contact_button'),
+                                'request_contact' => true,
+                            ]),
+                        ]);
+
+                    return $telegram->sendMessage([
+                        'chat_id' => $chatId,
+                        'text' => $this->t($chatId, 'enter_phone'),
+                        'reply_markup' => $keyboard,
+                    ]);
+                }
+
+                // 🔥 Resident bor — murojaatni boshlaymiz
+                $data = [
+                    'resident_id' => $resident->id,
+                    'phone' => $resident->phone,
+                    'fio' => $resident->full_name,
+                ];
+
+                Cache::put("tg_data_$chatId", $data);
+                Cache::put("tg_state_$chatId", 'region');
+
+                // Regionlarni chiqaramiz
+                $regions = \App\Models\Region::all();
+                $keyboard = Keyboard::make()->setResizeKeyboard(true)->setOneTimeKeyboard(true);
+                $userLang = Cache::get("tg_lang_$chatId", 'uz');
+
+                $buttons = [];
+
+                foreach ($regions as $region) {
+                    $buttons[] = Keyboard::button([
+                        'text' => $region->name[$userLang]
+                    ]);
+                }
+
+                foreach (array_chunk($buttons, 2) as $chunk) {
+                    $keyboard->row($chunk);
+                }
+
+                return $telegram->sendMessage([
+                    'chat_id' => $chatId,
+                    'text' => $this->t($chatId, 'select_district'),
+                    'reply_markup' => $keyboard
+                ]);
+            }
+            
+            if ($text === $this->t($chatId, 'confirm')) {
+            
+                    $data = Cache::get("tg_data_$chatId");
+                    $album = Cache::get("tg_album_files_$chatId", []);
+
+                    $application=Application::create([
+                        'resident_id' => $data['resident_id'],
+                        'region_id'   => $data['region_id'],
+                        'address'     => $data['address'],
+                        'message'     => $data['message'],
+                        'status_id'   => 1
+                    ]);
+                    // application_status_histories jadvaliga kirish
+                    $application->histories()->create([
+                        'status_id' => 1,
+                        'comment' => 'Murojaat qabul qilindi' ,   
+                    ]);
+                    foreach ($album as $filePath) {
+                        $application->photos()->create([
+                            'photo_path' => $filePath
+                        ]);
+                    }
+
+                    Cache::forget("tg_data_$chatId");
+                    Cache::forget("tg_state_$chatId");
+                    Cache::forget("tg_album_files_$chatId");
+                    $keyboard = Keyboard::make()
+                            ->setResizeKeyboard(true)
+                            ->setOneTimeKeyboard(false)
+                            ->row([
+                                Keyboard::button(['text' => $this->t($chatId, 'new_request')]),
+                                Keyboard::button(['text' => $this->t($chatId, 'my_requests')]),
+                            ]);
+
+                    $telegram->sendMessage([
+                        'chat_id' => $chatId,
+                        'text' => $this->t($chatId, 'request_done'),
+                        'reply_markup' => $keyboard
+                    ]);
+
+                    return response('ok');
+            }
+            if($text === $this->t($chatId, 'cancel')){
+                    Cache::forget("tg_data_$chatId");
+                    Cache::forget("tg_state_$chatId");
+
+                    $telegram->sendMessage([
+                        'chat_id' => $chatId,
+                        'text' => $this->t($chatId, 'request_cancel'),
+                        'reply_markup' => Keyboard::remove()
+                    ]);
+
+                    return response('ok');
             }
             if($state === 'ask_media'){
                 if ($text === $this->t($chatId, 'yes')) {
@@ -132,17 +361,20 @@ class TelegramWebhookController extends Controller
             }
             if ($state === 'waiting_media') {
 
+                $albumKey = "tg_album_files_{$chatId}";
+                
                 if ($message->getPhoto()) {
 
                     $photos = $message->getPhoto();
                     $photoArray = is_array($photos) ? $photos : $photos->all();
                     $lastPhoto = end($photoArray);
-
+                    log::info("Last Photo ID: " . ($lastPhoto ? $lastPhoto->file_id : 'none'));
                     if ($lastPhoto) {
 
                         $file = Telegram::getFile([
                             'file_id' => $lastPhoto->file_id
                         ]);
+                        
 
                         $filePath = $file->getFilePath();
 
@@ -153,14 +385,12 @@ class TelegramWebhookController extends Controller
                             . $filePath
                         );
 
-                        $fileName = 'uploads/images/' . uniqid() . '.jpg';
+                        $fileName = 'uploads/images/' . Str::uuid() . '.jpg';
                         \Storage::disk('public')->put($fileName, $contents);
-
-                        // Album fayllarini cache’da yig‘amiz
-                        $albumKey = "tg_album_files_$chatId";
                         $files = Cache::get($albumKey, []);
                         $files[] = $fileName;
-                        Cache::put($albumKey, $files, 10);
+                        Cache::put($albumKey, $files, now()->addMinutes(10));
+                        Log::info(Cache::get($albumKey));
                     }
                 }
 
@@ -184,68 +414,23 @@ class TelegramWebhookController extends Controller
                     $fileName = 'uploads/videos/' . uniqid() . '.mp4';
                     \Storage::disk('public')->put($fileName, $contents);
 
-                    $albumKey = "tg_album_files_$chatId";
                     $files = Cache::get($albumKey, []);
                     $files[] = $fileName;
-                    Cache::put($albumKey, $files, 10);
+                    Cache::put($albumKey, $files, now()->addMinutes(10));
                 }
+                
+                
+                $keyboard = Keyboard::make()->setResizeKeyboard(true)->row([
+                    Keyboard::button(['text' => $this->t($chatId, 'confirm')]),
+                    Keyboard::button(['text' => $this->t($chatId, 'cancel')]),
+                ]);
 
-                Cache::put($albumKey, $files, now()->addHours(1));
-                \App\Jobs\FinishTelegramAlbum::dispatch($chatId)
-                    ->delay(now()->addSeconds(2));
-
+                Telegram::sendMessage([
+                    'chat_id' => $chatId,
+                    'text' => $this->t($chatId, 'all_files_saved'),
+                    'reply_markup' => $keyboard
+                ]);
                 return response('ok', 200);
-
-            }
-            
-            if($state === 'confirming'){
-                if ($text === $this->t($chatId, 'confirm')) {
-
-                    $data = Cache::get("tg_data_$chatId");
-                    $album = Cache::get("tg_album_files_$chatId", []);
-
-                    $application=Application::create([
-                        'resident_id' => $data['resident_id'],
-                        'region_id'   => $data['region_id'],
-                        'address'     => $data['address'],
-                        'message'     => $data['message'],
-                        'status_id'   => 1
-                    ]);
-                    // application_status_histories jadvaliga kirish
-                    $application->histories()->create([
-                        'status_id' => 1,
-                        'comment' => 'Murojaat qabul qilindi' ,   
-                    ]);
-                    foreach ($album as $filePath) {
-                        $application->photos()->create([
-                            'photo_path' => $filePath
-                        ]);
-                    }
-
-                    Cache::forget("tg_data_$chatId");
-                    Cache::forget("tg_state_$chatId");
-                    Cache::forget("tg_album_files_$chatId");
-
-                    $telegram->sendMessage([
-                        'chat_id' => $chatId,
-                        'text' => $this->t($chatId, 'request_done'),
-                        'reply_markup' => Keyboard::remove()
-                    ]);
-
-                    return response('ok');
-                }
-                if($text === $this->t($chatId, 'cancel')){
-                    Cache::forget("tg_data_$chatId");
-                    Cache::forget("tg_state_$chatId");
-
-                    $telegram->sendMessage([
-                        'chat_id' => $chatId,
-                        'text' => $this->t($chatId, 'request_cancel'),
-                        'reply_markup' => Keyboard::remove()
-                    ]);
-
-                    return response('ok');
-                }
             }
 
 
@@ -429,6 +614,9 @@ class TelegramWebhookController extends Controller
         $texts = [
 
             'uz' => [
+                'select_action'=>"Kerakli amalni tanlang:",
+                'my_requests' => "📋 Mening murojaatlarim",
+                'new_request' => "✍️ Yangi murojaat yo‘llash",
                 'enter_phone' => "Telefon raqamingizni yuboring 👇",
                 'contact_button' => "📞 Kontakt yuborish",
                 'wrong_contact' => "❗️ Iltimos, \"Kontakt yuborish\" tugmasidan foydalaning. Boshqa odamning raqamini yubormang.",
@@ -452,6 +640,9 @@ class TelegramWebhookController extends Controller
             ],
 
             'qr' => [
+                'select_action'=>"Kerekli ámeldi tańlań:",
+                'my_requests' => "📋 Meniń múrájatlarım",
+                'new_request' => "✍️ Múrájat jollaw",
                 'enter_phone' => "Telefon nomerińizdi jiberiń 👇",
                 'contact_button' => "📞 Kontakt jiberiw",
                 'wrong_contact' => "❗️ Iltimas, \"Kontakt jiberiw\" túymesinen paydalanıń. Basqa adamnıń nomerin jibermeń.",
@@ -477,22 +668,22 @@ class TelegramWebhookController extends Controller
         return $texts[$lang][$key] ?? $texts['uz'][$key];
     }
 
+    public function finishAlbum($chatId)
+    {
 
+        Cache::put("tg_state_$chatId", 'confirming');
+        
+        $keyboard = Keyboard::make()->setResizeKeyboard(true)->row([
+            Keyboard::button(['text' => $this->t($chatId, 'confirm')]),
+            Keyboard::button(['text' => $this->t($chatId, 'cancel')]),
+        ]);
+
+        Telegram::sendMessage([
+            'chat_id' => $chatId,
+            'text' => $this->t($chatId, 'all_files_saved') ,
+            'reply_markup' => $keyboard
+        ]);
+    }
 
     
-    // 🖼️ Rasmni saqlash
-    // private function saveTelegramPhoto($photos)
-    // {
-    //     $photoArray = is_array($photos) ? $photos : $photos->all();
-    //     $lastPhoto = end($photoArray);
-    //     $file = Telegram::getFile(['file_id' => $lastPhoto->file_id]);
-
-    //     $filePath = $file->getFilePath();
-    //     $contents = file_get_contents("https://api.telegram.org/file/bot" . env('TELEGRAM_BOT_TOKEN') . "/" . $filePath);
-
-    //     $fileName = 'uploads/images/' . uniqid() . '.jpg';
-    //     Storage::disk('public')->put($fileName, $contents);
-
-    //     return $fileName;
-    // }
 }

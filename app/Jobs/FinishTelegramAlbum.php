@@ -34,9 +34,6 @@ class FinishTelegramAlbum implements ShouldQueue
             return;
         }
         Cache::put("tg_state_{$this->chatId}", 'confirming');
-        // Cache::forget($albumKey);
-        // Cache::forget("tg_state_{$this->chatId}");
-        // Cache::forget("tg_data_{$this->chatId}");
         $controller = new \App\Http\Controllers\TelegramWebhookController();
         $confirm = $controller->t($this->chatId, 'confirm');
         $cancel  = $controller->t($this->chatId, 'cancel');
